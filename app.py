@@ -28,6 +28,8 @@ from auth import (
     verify_password,
     verify_session_cookie,
 )
+import embeddings
+import store as store_module
 from backfill import backfill_project
 from dispatch import (
     build_recategorize_prompt,
@@ -453,6 +455,27 @@ def api_admin_export_audit(
 @app.get("/api/admin/audit/verify")
 def api_admin_verify_audit(_admin: str = Depends(require_admin)):
     return verify_audit_chain()
+
+
+@app.get("/api/retrieval/status")
+def api_retrieval_status(_user: str = Depends(require_auth)):
+    """What the search path is actually running.
+
+    The dashboard claims hybrid retrieval, so it has to be able to say when
+    that is not true. If the embedding model cannot load, search silently
+    degrades to lexical hashing and still returns results, which is the right
+    behaviour but the wrong thing to stay quiet about.
+
+    The first call loads the model, so it doubles as a warm-up: the operator
+    opening the dashboard pays that cost instead of the next search.
+    """
+    state = embeddings.status()
+    return {
+        **state,
+        "fusion": "reciprocal rank fusion",
+        "rrf_k": store_module.RRF_K,
+        "min_similarity": store_module.semantic_threshold(),
+    }
 
 
 @app.get("/api/projects")

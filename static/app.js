@@ -107,6 +107,31 @@ async function fetchProjects() {
   renderProjects(projects);
 }
 
+
+// Search claims to be hybrid, so the header has to admit when it is not. If the
+// embedding model will not load, retrieval still works but falls back to
+// lexical hashing, and the chip turns amber instead of pretending otherwise.
+async function loadRetrievalStatus() {
+  const chip = document.getElementById("retrieval-status");
+  if (!chip) return;
+  try {
+    const res = await apiFetch("/api/retrieval/status");
+    const s = await res.json();
+    chip.innerHTML = "";
+    chip.appendChild(el("span", "retrieval-dot"));
+    chip.appendChild(document.createTextNode(
+      s.semantic ? `hybrid retrieval · ${s.model}` : "lexical fallback"
+    ));
+    chip.classList.toggle("degraded", !s.semantic);
+    chip.title = s.semantic
+      ? `${s.detail}\nBM25 fused with vector similarity (RRF k=${s.rrf_k}, min cosine ${s.min_similarity}).`
+      : `${s.detail}\nParaphrase recall is degraded until the model loads.`;
+    chip.style.display = "";
+  } catch (err) {
+    chip.style.display = "none";
+  }
+}
+
 function renderProjects(projects) {
   const list = document.getElementById("project-list");
   list.innerHTML = "";
@@ -2523,6 +2548,7 @@ document.getElementById("dispatch-file").addEventListener("change", (e) => {
 
 fetchProjects();
 selectProject("");
+loadRetrievalStatus();
 pollActiveAgents();
 loadInteractions();
 loadAgentStatus();

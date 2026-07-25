@@ -11,6 +11,12 @@ cryptography==49.0.0
 distro==1.9.0
 docstring_parser==0.18.0
 fastapi==0.139.0
+# Local sentence embeddings for the semantic retrieval leg. Runs on CPU via
+# ONNX, no API key and no network calls after the first model download.
+# Pulls onnxruntime, numpy and tokenizers, which is most of this project's
+# install size. If it is missing, embeddings.py falls back to lexical hashing
+# and the dashboard reports retrieval as degraded.
+fastembed==0.8.0
 h11==0.16.0
 httpcore==1.0.9
 httptools==0.8.0

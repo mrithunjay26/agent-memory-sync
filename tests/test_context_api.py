@@ -1,11 +1,14 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+import embeddings
 import store
-from app import app, require_auth
+from app import app, require_admin, require_auth
 
 
 class ContextApiTestCase(unittest.TestCase):
@@ -27,6 +30,59 @@ class ContextApiTestCase(unittest.TestCase):
         app.dependency_overrides.clear()
         response = self.client.get("/api/context", params={"project": self.project})
         self.assertEqual(response.status_code, 401)
+
+    def test_retrieval_status_reports_the_model_search_actually_uses(self):
+        """The dashboard advertises hybrid retrieval, so this endpoint has to
+        report the real state rather than the intended one."""
+        response = self.client.get("/api/retrieval/status")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["model"], embeddings.active_model())
+        self.assertEqual(body["semantic"], embeddings.is_semantic())
+        self.assertEqual(body["rrf_k"], store.RRF_K)
+        self.assertEqual(body["min_similarity"], store.semantic_threshold())
+        self.assertTrue(body["detail"])
+
+    def test_retrieval_status_admits_when_the_embedding_model_is_unavailable(self):
+        """Degrading to lexical hashing is acceptable. Reporting it as semantic
+        search would not be."""
+        with mock.patch.object(embeddings, "_load_model", return_value=None):
+            body = self.client.get("/api/retrieval/status").json()
+
+        self.assertFalse(body["semantic"])
+        self.assertEqual(body["model"], embeddings.FALLBACK_MODEL_ID)
+        self.assertEqual(body["min_similarity"], store.SEMANTIC_MIN_SIMILARITY)
+
+    def test_retrieval_status_requires_authentication(self):
+        app.dependency_overrides.clear()
+        self.assertEqual(self.client.get("/api/retrieval/status").status_code, 401)
+
+    def test_only_the_auth_endpoints_are_reachable_without_a_session(self):
+        """The README promises every /api route is behind login. Adding a route
+        and forgetting the dependency is a silent hole, so the route table is
+        checked directly rather than one endpoint at a time.
+
+        The /api/auth/* endpoints are the deliberate exception: requiring a
+        session to log in would make logging in impossible.
+        """
+        allowed = {
+            "/api/auth/status",
+            "/api/auth/whoami",
+            "/api/auth/signup",
+            "/api/auth/login",
+            "/api/auth/logout",
+        }
+
+        unprotected = set()
+        for route in app.routes:
+            if not isinstance(route, APIRoute) or not route.path.startswith("/api/"):
+                continue
+            guards = {dep.call for dep in route.dependant.dependencies}
+            if not guards & {require_auth, require_admin}:
+                unprotected.add(route.path)
+
+        self.assertEqual(unprotected, allowed)
 
     def test_unknown_project_is_rejected(self):
         response = self.client.get("/api/context", params={"project": "/unknown"})

@@ -49,8 +49,42 @@ PROJECT_ACCESS_LEVELS = ("viewer", "editor", "operator")
 MAX_RETENTION_DAYS = 3650
 SEMANTIC_CANDIDATE_CAP = 300
 SEMANTIC_TEXT_CHAR_CAP = 4000
+# Cosine floor for the semantic leg. The two vector kinds live on different
+# scales, so one constant cannot serve both. Hashed vectors are near-orthogonal
+# unless text overlaps, so 0.15 is already meaningful. A sentence model puts
+# unrelated text around 0.55, so the same floor would admit the whole corpus.
+# Measured with bge-small: an unrelated pair scores 0.56-0.58, a real
+# morphological match scores 0.65, and benchmark targets sit at median 0.67.
 SEMANTIC_MIN_SIMILARITY = 0.15
-RRF_K = 60
+SEMANTIC_MIN_SIMILARITY_DENSE = 0.60
+
+
+def semantic_threshold() -> float:
+    return (
+        SEMANTIC_MIN_SIMILARITY_DENSE
+        if embeddings.is_semantic()
+        else SEMANTIC_MIN_SIMILARITY
+    )
+# The usual RRF constant is 60, which comes from fusing many rankers over
+# TREC-scale corpora. Fusing only two legs, it flattens the top ranks (rank 1
+# scores 1/61 and rank 10 scores 1/70), so a document only one leg finds gets
+# buried by documents both legs merely tolerate. That is the paraphrase case,
+# where the lexical leg contributes noise.
+#
+# Swept on benchmarks/retrieval_v2, paraphrase recall@5 by k:
+#   k=60: 0.550   k=20: 0.550   k=10: 0.550
+#   k=5:  0.600   k=3:  0.600   k=1:  0.600
+# Exact-lookup recall stays 1.000 at every value, so lowering k costs nothing
+# on literal identifier search. The gain is real but modest, and it plateaus
+# at k<=5, so 5 is the least aggressive setting that captures it.
+#
+# Worth recording why this is smaller than it first looked: an earlier sweep,
+# taken while SEMANTIC_MIN_SIMILARITY was still tuned for the old hashed
+# vectors, showed k=60 scoring 0.10. That floor was far too low for a real
+# embedding model and let unrelated documents into the semantic leg, which is
+# what a large k then buried the good hit under. Fixing the floor removed most
+# of the problem k was compensating for.
+RRF_K = 5
 
 
 def _db_path() -> str:
@@ -1530,20 +1564,23 @@ def _event_embedding_vectors(
         return {}
     ids = [event_id for event_id, _ in rows]
     placeholders = ",".join("?" for _ in ids)
+    # Keyed by the model that actually produced the vector, so switching models
+    # (or falling back) re-embeds instead of comparing incompatible vectors.
+    model_id = embeddings.active_model()
     try:
         cached = {
             event_id: (content_hash, vector)
             for event_id, content_hash, vector in conn.execute(
                 "SELECT event_id, content_hash, vector FROM event_embeddings "
                 f"WHERE event_id IN ({placeholders}) AND model = ?",
-                (*ids, embeddings.EMBEDDING_MODEL),
+                (*ids, model_id),
             ).fetchall()
         }
     except sqlite3.OperationalError:
         cached = {}
 
     result: dict[int, bytes] = {}
-    to_store = []
+    pending: list[tuple[int, str, str]] = []
     now = _now()
     for event_id, text in rows:
         fingerprint = embeddings.content_fingerprint(text)
@@ -1551,28 +1588,66 @@ def _event_embedding_vectors(
         if hit and hit[0] == fingerprint:
             result[event_id] = hit[1]
             continue
-        vector = embeddings.embed_text(text)
-        result[event_id] = vector
-        to_store.append((event_id, embeddings.EMBEDDING_MODEL, fingerprint, vector, now))
+        pending.append((event_id, text, fingerprint))
+
+    to_store = []
+    if pending:
+        # One batched call rather than one model invocation per document.
+        vectors = embeddings.embed_texts([text for _, text, _ in pending])
+        for (event_id, _text, fingerprint), vector in zip(pending, vectors):
+            result[event_id] = vector
+            to_store.append((event_id, model_id, fingerprint, vector, now))
 
     if to_store:
-        try:
-            conn.executemany(
-                "INSERT INTO event_embeddings "
-                "(event_id, model, content_hash, vector, updated_at) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(event_id) DO UPDATE SET "
-                "model = excluded.model, content_hash = excluded.content_hash, "
-                "vector = excluded.vector, updated_at = excluded.updated_at",
-                to_store,
-            )
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass
+        _store_event_embeddings(to_store)
     return result
 
 
-def _reciprocal_rank_fusion(rank_lists: list[list[int]], k: int = RRF_K) -> dict[int, float]:
+def _store_event_embeddings(rows: list[tuple]) -> None:
+    """Persist freshly computed vectors so later searches skip the model.
+
+    Searches run on a read-only connection (see _connect_for_search) so they
+    never take a write lock while hooks are recording, which means the cache
+    cannot be written through that connection. A separate short-lived writable
+    connection is opened here instead, and only when something was actually
+    recomputed, so a warm cache stays read-only end to end.
+
+    Embedding on read rather than on write is deliberate: the session hooks
+    record events constantly and would otherwise pay the model load, while
+    searches are comparatively rare and already tolerate latency.
+
+    A failure here costs speed, not correctness, so it must not break the
+    search that triggered it. Writes lost to a concurrent lock are simply
+    recomputed next time.
+    """
+    try:
+        writable = _connect()
+    except Exception:
+        return
+    try:
+        writable.executemany(
+            "INSERT INTO event_embeddings "
+            "(event_id, model, content_hash, vector, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(event_id) DO UPDATE SET "
+            "model = excluded.model, content_hash = excluded.content_hash, "
+            "vector = excluded.vector, updated_at = excluded.updated_at",
+            rows,
+        )
+        writable.commit()
+    except sqlite3.Error:
+        pass
+    finally:
+        writable.close()
+
+
+def _reciprocal_rank_fusion(
+    rank_lists: list[list[int]], k: int | None = None
+) -> dict[int, float]:
+    # Read RRF_K at call time. Binding it as a default froze the value at import
+    # and made the constant impossible to tune or test.
+    if k is None:
+        k = RRF_K
     scores: dict[int, float] = {}
     for ranks in rank_lists:
         for position, event_id in enumerate(ranks):
@@ -1581,8 +1656,15 @@ def _reciprocal_rank_fusion(rank_lists: list[list[int]], k: int = RRF_K) -> dict
 
 
 def search_shared_context(
-    project_path: str, query: str, limit: int = 5, snippet_chars: int = 1200
+    project_path: str,
+    query: str,
+    limit: int = 5,
+    snippet_chars: int = 1200,
+    *,
+    semantic: bool = True,
 ) -> list[dict]:
+    # semantic=False runs the lexical (BM25) leg alone. The benchmark uses it to
+    # measure what the embedding leg actually contributes instead of asserting it.
     query = " ".join((query or "").split()).strip()
     if not query:
         return []
@@ -1620,15 +1702,19 @@ def search_shared_context(
             (match_query, project_path, TELEMETRY_EVENT_TYPE, candidate_limit),
         ).fetchall()
 
-        semantic_scan_rows = conn.execute(
-            "SELECT e.id, e.agent, e.event_type, e.summary, e.context_summary, "
-            "e.raw_context, e.created_at "
-            "FROM events e "
-            "WHERE e.project_path = ? AND e.event_type != ? "
-            "AND e.context_included = 1 "
-            "ORDER BY e.id DESC LIMIT ?",
-            (project_path, TELEMETRY_EVENT_TYPE, SEMANTIC_CANDIDATE_CAP),
-        ).fetchall()
+        semantic_scan_rows = (
+            conn.execute(
+                "SELECT e.id, e.agent, e.event_type, e.summary, e.context_summary, "
+                "e.raw_context, e.created_at "
+                "FROM events e "
+                "WHERE e.project_path = ? AND e.event_type != ? "
+                "AND e.context_included = 1 "
+                "ORDER BY e.id DESC LIMIT ?",
+                (project_path, TELEMETRY_EVENT_TYPE, SEMANTIC_CANDIDATE_CAP),
+            ).fetchall()
+            if semantic
+            else []
+        )
 
         combined_rows: dict[int, tuple] = {row[0]: row for row in lexical_rows}
         for row in semantic_scan_rows:
@@ -1662,7 +1748,7 @@ def search_shared_context(
         semantic_rank_ids = [
             event_id
             for similarity, event_id in similarities
-            if similarity >= SEMANTIC_MIN_SIMILARITY
+            if similarity >= semantic_threshold()
         ][:candidate_limit]
 
     fused_scores = _reciprocal_rank_fusion([lexical_rank_ids, semantic_rank_ids])

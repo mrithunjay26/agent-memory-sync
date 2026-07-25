@@ -286,6 +286,9 @@ class ContextStoreTestCase(unittest.TestCase):
         self.assertEqual([match["agent"] for match in matches], ["codex"])
 
     def test_corpus_search_does_not_require_the_write_connection(self):
+        """Search reads through a read-only connection. It may opportunistically
+        persist computed embeddings so the next search skips the model, but that
+        write is best effort: an unwritable database costs speed, not results."""
         self.store.record_history_event(
             self.project, "codex", "readonly", "sandbox corpus evidence", 10
         )
@@ -293,14 +296,30 @@ class ContextStoreTestCase(unittest.TestCase):
             self.store,
             "_connect",
             side_effect=sqlite3.OperationalError("unable to open database file"),
-        ) as write_connect:
+        ):
+            matches = self.store.search_shared_context(
+                self.project, "sandbox evidence"
+            )
+
+        self.assertEqual(len(matches), 1)
+        self.assertIn("sandbox corpus evidence", matches[0]["snippet"])
+
+    def test_corpus_search_stops_writing_once_the_embedding_cache_is_warm(self):
+        """The first search pays to embed the corpus, every later one is pure
+        read. Without this the retriever re-embeds everything on each query,
+        which measured ~70x slower on the benchmark corpus."""
+        self.store.record_history_event(
+            self.project, "codex", "warm", "sandbox corpus evidence", 10
+        )
+        self.store.search_shared_context(self.project, "sandbox evidence")
+
+        with mock.patch.object(self.store, "_connect") as write_connect:
             matches = self.store.search_shared_context(
                 self.project, "sandbox evidence"
             )
 
         write_connect.assert_not_called()
         self.assertEqual(len(matches), 1)
-        self.assertIn("sandbox corpus evidence", matches[0]["snippet"])
 
     def test_corpus_search_matches_path_like_identifiers_as_single_tokens(self):
         self.store.record_history_event(
@@ -315,10 +334,17 @@ class ContextStoreTestCase(unittest.TestCase):
         self.assertEqual([match["agent"] for match in matches], ["codex"])
 
     def test_corpus_search_index_follows_edits_and_deletes(self):
+        # Edit propagation is a property of the lexical index, so it is asserted
+        # against the lexical leg alone. The nonsense markers here ("zzqux" vs
+        # "yyquux") are both out-of-vocabulary, and a sentence model places two
+        # meaningless strings in the same region (measured cosine 0.66), so the
+        # semantic leg legitimately still relates them after the edit. Mixing
+        # that in would test the embedding model, not index freshness.
+        def lexical(query):
+            return self.store.search_shared_context(self.project, query, semantic=False)
+
         note_id = self.store.create_context_note(self.project, "zzqux marker text")
-        self.assertEqual(
-            len(self.store.search_shared_context(self.project, "zzqux")), 1
-        )
+        self.assertEqual(len(lexical("zzqux")), 1)
 
         conn = sqlite3.connect(self._db_path)
         conn.execute(
@@ -327,14 +353,12 @@ class ContextStoreTestCase(unittest.TestCase):
         )
         conn.commit()
         conn.close()
-        self.assertEqual(
-            self.store.search_shared_context(self.project, "zzqux"), []
-        )
-        self.assertEqual(
-            len(self.store.search_shared_context(self.project, "yyquux")), 1
-        )
+        self.assertEqual(lexical("zzqux"), [])
+        self.assertEqual(len(lexical("yyquux")), 1)
 
+        # Deletion removes the row outright, so every leg must lose it.
         self.store.delete_context_note(self.project, note_id)
+        self.assertEqual(lexical("yyquux"), [])
         self.assertEqual(
             self.store.search_shared_context(self.project, "yyquux"), []
         )

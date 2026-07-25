@@ -14,12 +14,16 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable
 
+import embeddings
 import store
-from benchmarks.retrieval_v1 import load_dataset
+from benchmarks.retrieval_v2 import assert_zero_overlap, load_dataset
 
 
-MIN_QUERIES = 150
+# v2 is deliberately smaller than v1 and much harder. v1 had 180 queries that
+# keyword matching solved outright, so its size bought no signal.
+MIN_QUERIES = 40
 MAX_QUERIES = 300
+SUPPORTED_SCHEMA_VERSIONS = (2,)
 DEFAULT_LIMIT = 10
 STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
@@ -29,8 +33,11 @@ STOP_WORDS = {
 
 
 def validate_dataset(dataset: dict) -> dict:
-    if dataset.get("schema_version") != 1:
-        raise ValueError("Unsupported dataset schema_version; expected 1.")
+    if dataset.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
+        raise ValueError(
+            "Unsupported dataset schema_version; expected one of "
+            f"{SUPPORTED_SCHEMA_VERSIONS}."
+        )
     documents = dataset.get("documents")
     queries = dataset.get("queries")
     if not isinstance(documents, list) or not isinstance(queries, list):
@@ -314,12 +321,15 @@ def _load_predictions(spec: str, dataset: dict) -> tuple[str, dict]:
     return name, evaluate_predictions(dataset, predictions)
 
 
-def run_benchmark(*, systems: Iterable[str] = ("like", "fts5"),
+def run_benchmark(*, systems: Iterable[str] = ("like", "lexical", "hybrid"),
                   prediction_specs: Iterable[str] = ()) -> dict:
     dataset = load_dataset()
+    # The paraphrase split is only meaningful if it really shares no words with
+    # its targets, so verify that before reporting any number from it.
+    assert_zero_overlap()
     dataset_summary = validate_dataset(dataset)
     selected = list(dict.fromkeys(systems))
-    unknown = set(selected) - {"like", "fts5"}
+    unknown = set(selected) - {"like", "lexical", "hybrid"}
     if unknown:
         raise ValueError(f"Unknown built-in systems: {', '.join(sorted(unknown))}")
 
@@ -340,10 +350,16 @@ def run_benchmark(*, systems: Iterable[str] = ("like", "fts5"),
                 "writes, and incremental FTS trigger maintenance."
             ),
         },
+        "system_notes": {
+            "like": "Naive SQL LIKE scan, kept as a floor.",
+            "lexical": "Production path with the embedding leg disabled (SQLite FTS5/BM25 only).",
+            "hybrid": (
+                f"Production path: FTS5/BM25 fused with {embeddings.active_model()} "
+                "vector similarity via reciprocal rank fusion."
+            ),
+        },
         "not_run": {
-            "dense_vectors": "No dense retriever or embedding model is implemented.",
-            "hybrid": "Requires a dense retriever in addition to FTS5.",
-            "hybrid_plus_code_graph": "No repository code graph is implemented.",
+            "hybrid_plus_code_graph": "No repository code graph is wired into this benchmark.",
             "bluebird": "Requires authorized Bluebird access and an identical external corpus.",
         },
     }
@@ -363,8 +379,15 @@ def run_benchmark(*, systems: Iterable[str] = ("like", "fts5"),
             report["systems"]["like"] = _run_system(
                 dataset, project_path, event_to_document, search_like
             )
-        if "fts5" in selected:
-            report["systems"]["fts5"] = _run_system(
+        if "lexical" in selected:
+            report["systems"]["lexical"] = _run_system(
+                dataset,
+                project_path,
+                event_to_document,
+                lambda p, q, n: store.search_shared_context(p, q, n, semantic=False),
+            )
+        if "hybrid" in selected:
+            report["systems"]["hybrid"] = _run_system(
                 dataset, project_path, event_to_document, store.search_shared_context
             )
 
@@ -418,7 +441,10 @@ def main() -> None:
     export.add_argument("--output", required=True, help="Destination JSON path")
     run = subparsers.add_parser("run", help="Run retrieval systems and print a report")
     run.add_argument(
-        "--systems", nargs="+", choices=("like", "fts5"), default=("like", "fts5")
+        "--systems",
+        nargs="+",
+        choices=("like", "lexical", "hybrid"),
+        default=("like", "lexical", "hybrid"),
     )
     run.add_argument(
         "--predictions", action="append", default=[], metavar="NAME=PATH",

@@ -4,7 +4,7 @@ Here's the annoying thing this project fixes: if you run Claude Code and Codex C
 
 AgentMemorySync is a shared timeline plus a local dashboard that closes that gap. Every turn either agent takes gets recorded, the next session (from *either* agent) gets a compact summary of what already happened, file edits get cross-checked for conflicts, and you get one place to watch real measured token savings and fire off new prompts to either agent.
 
-It's self-hosted and single-user on purpose. This runs on your own machine, talks to your local Claude Code / Codex install, and stores everything locally. No account on some central server, nothing leaves your machine unless you explicitly dispatch a prompt.
+It's self-hosted and single-user on purpose. This runs on your own machine, talks to your local Claude Code / Codex install, and stores everything locally. No account on some central server, and none of your data leaves your machine unless you explicitly dispatch a prompt. The one outbound request the app makes on its own is downloading the embedding model (64 MB on disk, once, from Hugging Face) the first time you search; it sends no repo content, and search falls back to lexical ranking if you block it.
 
 ## How it works
 
@@ -82,7 +82,10 @@ It's self-hosted and single-user on purpose. This runs on your own machine, talk
   **Read the safety note below before you use this.**
 - **`auth.py`**: self-hosted, one admin account. First visit to the
   dashboard creates it, and every `/api/*` route needs you logged in after
-  that.
+  that, except the five `/api/auth/*` endpoints themselves (status, whoami,
+  signup, login, logout), which cannot require a session without making
+  login impossible. A test walks the app's route table and fails if any
+  other route is reachable unauthenticated, so this stays true.
 
 ## Canonical pooled context
 
@@ -100,11 +103,15 @@ There are two layers here, and they're kept deliberately separate:
 - The **active working set** is the compact session digests plus whatever's
   pinned or recent. It's identical for Claude Code and Codex. Full native
   history is still searchable by either agent through provider-neutral
-  hybrid retrieval, SQLite FTS5/BM25 lexical ranking fused (via reciprocal
-  rank fusion) with hashed n-gram embedding similarity, so a rephrased
-  question can still pull up a passage that shares no exact words with it
- , via the `shared_context.py` command (and MCP clients get it through
-  `search_project_context`); none of that gets copied into every prompt.
+  hybrid retrieval: SQLite FTS5/BM25 lexical ranking fused (via reciprocal
+  rank fusion) with local sentence-embedding similarity, so a rephrased
+  question can pull up a passage that shares no exact words with it. The
+  embeddings come from `bge-small-en-v1.5` running on CPU through ONNX, with
+  no API key and no network calls after the first model download. See
+  [Retrieval benchmark](#retrieval-benchmark) for what that buys, measured.
+  Search runs via the `shared_context.py` command (and MCP clients get it
+  through `search_project_context`); none of that gets copied into every
+  prompt.
   Whenever a working set isn't empty, it includes the exact read-only
   command you'd run to dig deeper.
 
@@ -309,8 +316,10 @@ divided by the total native usage snapshotted. Deliveries recorded before
 this snapshot mechanism existed reconstruct the historical pool size from
 the permanent, timestamped event log instead of getting credited with
 today's (bigger) pool. Until at least one delivery reflects a pool with
-nonzero native usage, the UI just says **awaiting baseline** and reports no
-savings number. The corpus-to-working-set compression percentage is a
+nonzero native usage, the panel reports `baseline_status: not_established`
+and says so in plain words ("no pooled session yet carries a measured
+native-usage cost, so no savings are claimed") rather than showing a
+number. The corpus-to-working-set compression percentage is a
 separate, always-available measured size ratio, and it's not presented as
 token savings either, those are two different numbers.
 
@@ -329,6 +338,15 @@ yours to control per request.
 ## Limitations
 
 - Claude Code + Codex only, no Cursor, Windsurf, or Aider support.
+- Semantic retrieval needs the embedding model downloaded once. On a machine
+  with no network access it never loads, and search degrades to the hashed
+  lexical fallback, which scores 0.05 on the paraphrase split instead of
+  0.60. The dashboard's header chip turns amber and says "lexical fallback"
+  when this happens, so the degradation is visible rather than silent.
+- The first search in a process pays the model load and embeds the corpus
+  (~2.9s on the 60-document benchmark corpus). Vectors are cached in SQLite
+  afterwards, but a long-lived dashboard absorbs that better than a one-shot
+  CLI call does.
 - Repository lexical search covers common source/config/document formats;
   structural symbol and relationship resolution currently covers Python
   only.
@@ -355,25 +373,64 @@ Run the versioned retrieval regression suite with:
 
 ```powershell
 .\.venv\Scripts\python.exe benchmark.py validate
-.\.venv\Scripts\python.exe benchmark.py export-dataset --output retrieval-v1.json
+.\.venv\Scripts\python.exe benchmark.py export-dataset --output retrieval-v2.json
 .\.venv\Scripts\python.exe benchmark.py run
 .\.venv\Scripts\python.exe benchmark.py run --json --output benchmark-report.json
 ```
 
-The built-in dataset has 180 labeled queries: 30 each for exact lookup,
-paraphrased decision recall, code navigation, change localization,
-dependency tracing, and architecture. It compares the legacy SQL `LIKE`
-scan with the production FTS5/BM25 path and reports Recall@5, nDCG@10,
-evidence precision, MRR, estimated evidence tokens, p50/p95 latency, and
-corpus/indexing cost.
+The built-in dataset is 60 documents and 40 labeled queries split evenly
+between two deliberately opposed categories:
+
+- **exact_lookup**, where the query names a literal identifier. Keyword
+  matching should win here, and this split exists to catch a semantic
+  retriever that buys recall by breaking literal search.
+- **paraphrased_decision_recall**, where the query shares **zero content
+  words** with the passage it should find. Keyword matching has nothing to
+  match on, so this split isolates exactly what the embedding leg adds.
+
+The zero-overlap property is enforced in code, not asserted in prose:
+`benchmarks/retrieval_v2.assert_zero_overlap()` raises if any paraphrase
+query shares a content word with its target, and a test fails the build if
+it does. Every scenario also carries a hard negative built from the query's
+own vocabulary, so a retriever cannot score by keyword overlap alone.
+
+The last committed run (`benchmarks/retrieval-current.json`) compares three
+systems: the legacy SQL `LIKE` scan, the production path with the embedding
+leg switched off (BM25 only), and the full production path.
+
+| system | R@5 | nDCG@10 | MRR | exact | paraphrase | p50 |
+|---|---|---|---|---|---|---|
+| `like` (naive scan) | 0.525 | 0.524 | 0.516 | 1.00 | 0.05 | 2.4 ms |
+| `lexical` (BM25 only) | 0.500 | 0.500 | 0.500 | 1.00 | 0.00 | 8.5 ms |
+| `hybrid` (production) | 0.800 | 0.670 | 0.599 | 1.00 | 0.60 | 21.4 ms |
+
+The paraphrase column is the honest version of the claim this project makes
+about semantic recall: BM25 alone scores 0.00 there, and fusing the
+embedding leg takes it to 0.60 while exact lookup stays at 1.00. It is also
+the number that shows why this rewrite happened. The earlier implementation
+used hashed n-grams, which is a lexical signal in a vector's clothing: two
+paraphrases with no shared words hash into disjoint buckets. It scored 0.05
+on this split, against 0.00 for BM25 alone, so the older README's claim
+about rephrased questions was not supported by the code underneath it.
+
+Also reported but omitted from the table for width: evidence precision@5,
+estimated evidence tokens, p95 latency, and corpus/indexing cost.
+
+Two caveats on those latencies. The first search after startup is far
+slower than the p50 above (roughly 2.9s on this corpus) because it loads
+the embedding model and embeds the corpus once; vectors are then cached in
+SQLite keyed by content hash and model id, so steady-state search is ~21 ms
+and re-embeds only what changed. And if the embedding model cannot be
+loaded at all, retrieval degrades to the hashed fallback rather than
+failing, which the dashboard reports as degraded rather than quietly
+claiming semantic search.
 
 The suite is synthetic and exists to catch retrieval regressions. It isn't
 evidence of real-world task completion or parity with another product. The
 report leaves answer-level task completion and citation correctness unset,
-and lists dense, hybrid, code-graph, and Bluebird comparisons as
-unavailable until those systems can actually run against it. To score one
-of those systems later, hand it a JSON object mapping query ids to ranked
-document-id arrays:
+and lists code-graph and Bluebird comparisons as unavailable until those
+systems can actually run against it. To score one of those systems later,
+hand it a JSON object mapping query ids to ranked document-id arrays:
 
 ```powershell
 .\.venv\Scripts\python.exe benchmark.py run --predictions dense=predictions.json

@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-<link rel="stylesheet" href="/static/style.css?v=3" />
+<link rel="stylesheet" href="/static/style.css?v=4" />
 </head>
 <body>
 <div id="toasts" class="toasts"></div>
@@ -71,6 +71,7 @@
       </div>
       <div class="topbar-actions">
         <span class="status-live"><span class="live-dot"></span> streaming</span>
+        <span id="retrieval-status" class="status-live retrieval-chip" style="display:none;"></span>
         <button id="backfill-btn" class="btn btn-secondary" style="display:none;" type="button">Import history</button>
         <span id="backfill-status" class="status"></span>
         <button id="open-settings" class="icon-btn" title="Agent connections &amp; models" type="button">
@@ -443,7 +444,7 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=3"></script>
-<script src="/static/cockpit.js?v=3"></script>
+<script src="/static/app.js?v=4"></script>
+<script src="/static/cockpit.js?v=4"></script>
 </body>
 </html>
